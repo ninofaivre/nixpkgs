@@ -130,6 +130,12 @@ in
       '';
     };
     # TODO: perhaps options for more common stuff like cache size or forwarding
+    luaModules = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
+      description = "TODO";
+      example = "TODO";
+    };
   };
 
   ###### implementation
@@ -172,6 +178,18 @@ in
         "kres-cache-gc.service"
       ] ++ map (i: "kresd@${toString i}.service") (lib.range 1 cfg.instances);
     };
+    systemd.services."kresd@".environment =
+      let
+        luaEnv = pkgs.symlinkJoin {
+          name = "kres_modules-lua-env";
+          paths =
+            cfg.luaModules ++ (builtins.map (package: package.propagatedBuildInputs or [ ]) cfg.luaModules);
+        };
+      in
+      {
+        LUA_PATH = "${luaEnv}/share/lua/5.1/?.lua;${luaEnv}/share/lua/5.1/?/init.lua;;";
+        LUA_CPATH = "${luaEnv}/lib/lua/5.1/?.so";
+      };
     systemd.services."kresd@".serviceConfig = {
       ExecStart =
         "${cfg.package}/bin/kresd --noninteractive "
