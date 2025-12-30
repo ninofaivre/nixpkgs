@@ -46,19 +46,57 @@ let
   serverConfigFile = settingsFormat.generate "server.toml" (filterConfig cfg.serverSettings);
   clientConfigFile = settingsFormat.generate "kanidm-config.toml" (filterConfig cfg.clientSettings);
   unixConfigFile = settingsFormat.generate "kanidm-unixd.toml" (filterConfig cfg.unixSettings);
-  provisionSecretFiles = filter (x: x != null) (
-    [
-      cfg.provision.idmAdminPasswordFile
-      cfg.provision.adminPasswordFile
-    ]
-    ++ optional (cfg.provision.extraJsonFile != null) cfg.provision.extraJsonFile
-    ++ mapAttrsToList (_: x: x.basicSecretFile) cfg.provision.systems.oauth2
-  );
   secretPaths = [
     cfg.serverSettings.tls_chain
     cfg.serverSettings.tls_key
-  ]
-  ++ optionals cfg.provision.enable provisionSecretFiles;
+  ];
+  provisionSecretFilesToSystemdCredential =
+    (builtins.foldl'
+      (
+        acc:
+        { name, value }:
+        if value.basicSecretFile == null then
+          acc
+        else
+          {
+            index = acc.index + 1;
+            result = acc.result // {
+              "provision.systems.oauth2.${name}.basicSecretFile" = {
+                # using ${name} instead of ${acc.index} would imply many edge cases to comply with systemd credentials
+                # naming (len < 255, no '/' or ':' or char outside of ascii range [32,127)) while avoiding collisions
+                credentialName = "provision.systems.oauth2.${toString acc.index}.basicSecretFile";
+                hostFilePath = value.basicSecretFile;
+              };
+            };
+          }
+      )
+      {
+        result = { };
+        index = 0;
+      }
+      (lib.attrsToList cfg.provision.systems.oauth2)
+    ).result
+    // (builtins.foldl'
+      (
+        acc: el:
+        if cfg.provision."${el}" == null then
+          acc
+        else
+          acc
+          // {
+            "provision.${el}" = {
+              credentialName = "provision.${el}";
+              hostFilePath = cfg.provision."${el}";
+            };
+          }
+      )
+      { }
+      [
+        "adminPasswordFile"
+        "idmAdminPasswordFile"
+        "extraJsonFile"
+      ]
+    );
 
   # Merge bind mount paths and remove paths where a prefix is already mounted.
   # This makes sure that if e.g. the tls_chain is in the nix store and /nix/store is already in the mount
@@ -143,7 +181,9 @@ let
   # Only recover the admin account if a password should explicitly be provisioned
   # for the account. Otherwise it is not needed for provisioning.
   maybeRecoverAdmin = optionalString (cfg.provision.adminPasswordFile != null) ''
-    KANIDM_ADMIN_PASSWORD=$(< ${cfg.provision.adminPasswordFile})
+    KANIDM_ADMIN_PASSWORD=$(< ''${CREDENTIALS_DIRECTORY}/${
+      provisionSecretFilesToSystemdCredential."provision.adminPasswordFile".credentialName
+    })
     # We always reset the admin account password if a desired password was specified.
     if ! KANIDM_RECOVER_ACCOUNT_PASSWORD=$KANIDM_ADMIN_PASSWORD ${cfg.package}/bin/kanidmd recover-account -c ${serverConfigFile} admin --from-environment >/dev/null; then
       echo "Failed to recover admin account" >&2
@@ -157,7 +197,9 @@ let
   recoverIdmAdmin =
     if cfg.provision.idmAdminPasswordFile != null then
       ''
-        KANIDM_IDM_ADMIN_PASSWORD=$(< ${cfg.provision.idmAdminPasswordFile})
+        KANIDM_IDM_ADMIN_PASSWORD=$(< ''${CREDENTIALS_DIRECTORY}/${
+          provisionSecretFilesToSystemdCredential."provision.idmAdminPasswordFile".credentialName
+        })
         # We always reset the idm_admin account password if a desired password was specified.
         if ! KANIDM_RECOVER_ACCOUNT_PASSWORD=$KANIDM_IDM_ADMIN_PASSWORD ${cfg.package}/bin/kanidmd recover-account -c ${serverConfigFile} idm_admin --from-environment >/dev/null; then
           echo "Failed to recover idm_admin account" >&2
@@ -180,12 +222,32 @@ let
       '';
 
   finalJson =
-    if cfg.provision.extraJsonFile != null then
-      ''
-        <(${lib.getExe pkgs.yq-go} '. *+ load("${cfg.provision.extraJsonFile}") | (.. | select(type == "!!seq")) |= unique' ${provisionStateJson})
-      ''
-    else
-      provisionStateJson;
+    let
+      unpatchedJsonFile =
+        if cfg.provision.extraJsonFile != null then
+          ''
+            <(${lib.getExe pkgs.yq-go} '. *+ load(strenv(CREDENTIALS_DIRECTORY) + "/${
+              provisionSecretFilesToSystemdCredential."provision.extraJsonFile".credentialName
+            }") | (.. | select(type == "!!seq")) |= unique' ${provisionStateJson})
+          ''
+        else
+          provisionStateJson;
+      yqPatchToReplaceHostSecretsBySystemdCredentials =
+        (builtins.foldl' (
+          acc:
+          { name, value }:
+          if value.basicSecretFile == null then
+            acc
+          else
+            ''${acc}.systems.oauth2."${name}".basicSecretFile=(strenv(CREDENTIALS_DIRECTORY) + "/${
+              provisionSecretFilesToSystemdCredential."provision.systems.oauth2.${name}.basicSecretFile".credentialName
+            }") | ''
+        ) "" (lib.attrsToList cfg.provision.systems.oauth2))
+        + " .";
+    in
+    ''
+      <(${lib.getExe pkgs.yq-go} '${yqPatchToReplaceHostSecretsBySystemdCredentials}' ${unpatchedJsonFile})
+    '';
 
   postStartScript = pkgs.writeShellScript "post-start" ''
     set -euo pipefail
@@ -909,6 +971,14 @@ in
           User = "kanidm";
           Group = "kanidm";
 
+          LoadCredential = (
+            [ ]
+            ++ optionals cfg.provision.enable (
+              map (v: "${v.credentialName}:${v.hostFilePath}") (
+                builtins.attrValues provisionSecretFilesToSystemdCredential
+              )
+            )
+          );
           BindPaths = [
             # To store backups
             cfg.serverSettings.online_backup.path
