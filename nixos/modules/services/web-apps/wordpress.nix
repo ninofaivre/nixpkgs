@@ -14,6 +14,10 @@ let
   webserver = config.services.${cfg.webserver};
   stateDir = hostName: "/var/lib/wordpress/${hostName}";
 
+  phpfpmPoolName = hostName: "wordpress-${hostName}";
+  phpfpmPoolOpt = hostName:
+    config.services.phpfpm.pools.${phpfpmPoolName hostName};
+
   pkg =
     hostName: cfg:
     pkgs.stdenv.mkDerivation rec {
@@ -30,6 +34,14 @@ let
         # symlink uploads directory
         ln -s ${cfg.uploadsDir} $out/share/wordpress/wp-content/uploads
         ln -s ${cfg.fontsDir} $out/share/wordpress/wp-content/fonts
+        ${optionalString (cfg.pluginsDir != null) ''
+          rm -rf $out/share/wordpress/wp-content/plugins
+          ln -s ${cfg.pluginsDir} $out/share/wordpress/wp-content/plugins
+        ''}
+        ${optionalString (cfg.themesDir != null) ''
+          rm -rf $out/share/wordpress/wp-content/themes
+          ln -s ${cfg.themesDir} $out/share/wordpress/wp-content/themes
+        ''}
 
         # https://github.com/NixOS/nixpkgs/pull/53399
         #
@@ -39,16 +51,35 @@ let
         # Since hard linking directories is not allowed, copying is the next best thing.
 
         # copy additional plugin(s), theme(s) and language(s)
+        ${if cfg.themesDir == null then
+          concatStringsSep "\n" (
+            mapAttrsToList (
+              name: theme: "cp -r ${theme} $out/share/wordpress/wp-content/themes/${name}"
+            ) cfg.themes
+          )
+        else ""}
+        ${if cfg.pluginsDir == null then
+          concatStringsSep "\n" (
+            mapAttrsToList (
+              name: plugin: "cp -r ${plugin} $out/share/wordpress/wp-content/plugins/${name}"
+            ) cfg.plugins
+          )
+        else ""}
+
+        mkdir -p $out/share/wordpress/wp-content/mu-plugins
         ${concatStringsSep "\n" (
           mapAttrsToList (
-            name: theme: "cp -r ${theme} $out/share/wordpress/wp-content/themes/${name}"
-          ) cfg.themes
+            name: mu-plugin: ''
+              ${if mu-plugin.plugin != null then
+                  "cp -r ${mu-plugin.plugin} $out/share/wordpress/wp-content/mu-plugins/${name}"
+                else ""
+              }
+              cp -r ${mu-plugin.loader { pluginName = name; siteName = hostName; }} $out/share/wordpress/wp-content/mu-plugins/${name}-loader.php
+            ''
+          ) cfg.muPlugins
         )}
-        ${concatStringsSep "\n" (
-          mapAttrsToList (
-            name: plugin: "cp -r ${plugin} $out/share/wordpress/wp-content/plugins/${name}"
-          ) cfg.plugins
-        )}
+
+        mkdir -p $out/share/wordpress/wp-content/languages
         ${concatMapStringsSep "\n" (
           language: "cp -r ${language} $out/share/wordpress/wp-content/languages/"
         ) cfg.languages}
@@ -176,6 +207,22 @@ let
           '';
         };
 
+        pluginsDir = mkOption {
+          type = types.nullOr types.path;
+          default = null;
+          description = ''
+            This directory is used to store plugins. It enables an imperative plugin management, thus disabling `services.wordpress.sites.<name>.plugins`.
+          '';
+        };
+
+        themesDir = mkOption {
+          type = types.nullOr types.path;
+          default = null;
+          description = ''
+            This directory is used to store themes. It enables an imperative themes management, thus disabling `services.wordpress.sites.<name>.themes`.
+          '';
+        };
+
         plugins = mkOption {
           type =
             with types;
@@ -188,6 +235,34 @@ let
           default = { };
           description = ''
             Path(s) to respective plugin(s) which are copied from the 'plugins' directory.
+
+            ::: {.note}
+            These plugins need to be packaged before use, see example.
+            :::
+          '';
+          example = literalExpression ''
+            {
+              inherit (pkgs.wordpressPackages.plugins) embed-pdf-viewer-plugin;
+            }
+          '';
+        };
+        muPlugins = mkOption {
+          type =
+            with types;
+            attrsOf (submodule {
+              options = {
+                plugin = mkOption { type = nullOr path; default = null; };
+                loader = mkOption { type = functionTo path; };
+                phpfpmLoadCredential = mkOption {
+                  type = listOf str;
+                  default = [];
+                };
+              };
+            });
+          default = { };
+          description = ''
+            TODO update this
+            Path(s) to respective plugin(s) which are copied from the 'mu-plugins' directory. Can be a raw php file to load and/or configure a mu-plugin.
 
             ::: {.note}
             These plugins need to be packaged before use, see example.
@@ -442,42 +517,115 @@ in
   # implementation
   config = mkIf (eachSite != { }) (mkMerge [
     {
-
-      assertions =
-        (mapAttrsToList (hostName: cfg: {
+      assertions = concatLists (mapAttrsToList (hostName: cfg: [
+        {
           assertion = cfg.database.createLocally -> cfg.database.user == user;
           message = ''services.wordpress.sites."${hostName}".database.user must be ${user} if the database is to be automatically provisioned'';
-        }) eachSite)
-        ++ (mapAttrsToList (hostName: cfg: {
+        }
+        {
           assertion = cfg.database.createLocally -> cfg.database.passwordFile == null;
           message = ''services.wordpress.sites."${hostName}".database.passwordFile cannot be specified if services.wordpress.sites."${hostName}".database.createLocally is set to true.'';
-        }) eachSite);
+        }
+        {
+          assertion = cfg.pluginsDir != null -> cfg.plugins == { };
+          message = ''services.wordpress.sites."${hostName}".pluginsDir cannot be specified if services.wordpress.plugins is used.'';
+        }
+        {
+          assertion = cfg.themesDir != null -> cfg.themes == { };
+          message = ''services.wordpress.sites."${hostName}".themesDir cannotbe specified if services.wordpress.themes is used.'';
+        }
+      ]) eachSite);
 
-      services.mysql = mkIf (any (v: v.database.createLocally) (attrValues eachSite)) {
-        enable = true;
-        package = mkDefault pkgs.mariadb;
-        ensureDatabases = mapAttrsToList (hostName: cfg: cfg.database.name) eachSite;
-        ensureUsers = mapAttrsToList (hostName: cfg: {
-          name = cfg.database.user;
-          ensurePermissions = {
-            "${cfg.database.name}.*" = "ALL PRIVILEGES";
-          };
-        }) eachSite;
-      };
+      services.mysql = mkMerge ((mapAttrsToList (hostName: cfg:
+        mkIf cfg.database.createLocally {
+          enable = true;
+          ensureDatabases = [ cfg.database.name ];
+          ensureUsers = [{
+            name = cfg.database.user;
+            ensurePermissions."${cfg.database.name}.*" = "ALL PRIVILEGES";
+          }];
+        }) eachSite) ++ [{
+          package = mkDefault pkgs.mariadb;
+        }]);
 
       services.phpfpm.pools = mapAttrs' (
         hostName: cfg:
-        (nameValuePair "wordpress-${hostName}" {
+        (nameValuePair (phpfpmPoolName hostName) {
           inherit user;
           group = webserver.group;
           settings = {
             "listen.owner" = webserver.user;
             "listen.group" = webserver.group;
-          }
-          // cfg.poolConfig;
+          } // cfg.poolConfig;
         })
       ) eachSite;
 
+      systemd = mkMerge (mapAttrsToList (hostName: cfg: {
+        tmpfiles.rules = [
+          "d '${stateDir hostName}' 0750 ${user} ${webserver.group} - -"
+          "d '${cfg.uploadsDir}' 0750 ${user} ${webserver.group} - -"
+          "Z '${cfg.uploadsDir}' 0750 ${user} ${webserver.group} - -"
+          "d '${cfg.fontsDir}' 0750 ${user} ${webserver.group} - -"
+          "Z '${cfg.fontsDir}' 0750 ${user} ${webserver.group} - -"
+        ] ++ optionals (cfg.pluginsDir != null) [
+          "d '${cfg.pluginsDir}' 0770 ${user} ${webserver.group} - -"
+          "Z '${cfg.pluginsDir}' 0770 ${user} ${webserver.group} - -"
+        ]
+        ++ optionals (cfg.themesDir != null) [
+          "d '${cfg.themesDir}' 0770 ${user} ${webserver.group} - -"
+          "Z '${cfg.themesDir}' 0770 ${user} ${webserver.group} - -"
+        ];
+
+        services."wordpress-init-${hostName}" = {
+          wantedBy = [ "multi-user.target" ];
+          before = [
+            "phpfpm-wordpress-${hostName}.service"
+          ];
+          after = optional cfg.database.createLocally "mysql.service";
+          script = secretsScript (stateDir hostName);
+
+          serviceConfig = {
+            Type = "oneshot";
+            User = user;
+            Group = webserver.group;
+          };
+        };
+
+        services."phpfpm-wordpress-${hostName}".serviceConfig =
+        let
+          wpContent = "${pkg hostName cfg}/share/wordpress/wp-content";
+        in
+        {
+          # TMP hard coded uid and gid
+          TemporaryFileSystem = [
+            "${wpContent}:uid=987,gid=54,mode=0771"
+          ];
+          BindPaths = [
+            "${cfg.uploadsDir}:${wpContent}/uploads"
+            "${cfg.fontsDir}:${wpContent}/fonts"
+          ] ++ optional (cfg.themesDir != null) [
+            "${cfg.themesDir}:${wpContent}/themes"
+          ] ++ optional (cfg.pluginsDir != null) [
+            "${cfg.pluginsDir}:${wpContent}/plugins"
+          ] ++ optional (cfg.pluginsDir != null || cfg.themesDir != null) [
+            "${wpContent}/mu-plugins"
+            "${wpContent}/languages"
+            "${wpContent}/index.php"
+          ];
+
+          LoadCredential =
+            builtins.concatLists (lib.mapAttrsToList (name: mu-plugin:
+              (map (el: "${name}.${el}") mu-plugin.phpfpmLoadCredential)
+            ) cfg.muPlugins);
+        };
+
+        services.httpd.after = mkIf cfg.database.createLocally [ "mysql.service" ];
+      }) eachSite);
+
+      users.users.${user} = {
+        group = webserver.group;
+        isSystemUser = true;
+      };
     }
 
     (mkIf (cfg.webserver == "httpd") {
@@ -495,7 +643,7 @@ in
                   <FilesMatch "\.php$">
                     <If "-f %{REQUEST_FILENAME}">
                       SetHandler "proxy:unix:${
-                        config.services.phpfpm.pools."wordpress-${hostName}".socket
+                        (phpfpmPoolOpt hostName).socket
                       }|fcgi://localhost/"
                     </If>
                   </FilesMatch>
@@ -527,45 +675,6 @@ in
       };
     })
 
-    {
-      systemd.tmpfiles.rules = flatten (
-        mapAttrsToList (hostName: cfg: [
-          "d '${stateDir hostName}' 0750 ${user} ${webserver.group} - -"
-          "d '${cfg.uploadsDir}' 0750 ${user} ${webserver.group} - -"
-          "Z '${cfg.uploadsDir}' 0750 ${user} ${webserver.group} - -"
-          "d '${cfg.fontsDir}' 0750 ${user} ${webserver.group} - -"
-          "Z '${cfg.fontsDir}' 0750 ${user} ${webserver.group} - -"
-        ]) eachSite
-      );
-
-      systemd.services = mkMerge [
-        (mapAttrs' (
-          hostName: cfg:
-          (nameValuePair "wordpress-init-${hostName}" {
-            wantedBy = [ "multi-user.target" ];
-            before = [ "phpfpm-wordpress-${hostName}.service" ];
-            after = optional cfg.database.createLocally "mysql.service";
-            script = secretsScript (stateDir hostName);
-
-            serviceConfig = {
-              Type = "oneshot";
-              User = user;
-              Group = webserver.group;
-            };
-          })
-        ) eachSite)
-
-        (optionalAttrs (any (v: v.database.createLocally) (attrValues eachSite)) {
-          httpd.after = [ "mysql.service" ];
-        })
-      ];
-
-      users.users.${user} = {
-        group = webserver.group;
-        isSystemUser = true;
-      };
-    }
-
     (mkIf (cfg.webserver == "nginx") {
       services.nginx = {
         enable = true;
@@ -586,7 +695,7 @@ in
               priority = 500;
               extraConfig = ''
                 fastcgi_split_path_info ^(.+\.php)(/.+)$;
-                fastcgi_pass unix:${config.services.phpfpm.pools."wordpress-${hostName}".socket};
+                fastcgi_pass unix:${(phpfpmPoolOpt hostName).socket};
                 fastcgi_index index.php;
                 include "${config.services.nginx.package}/conf/fastcgi.conf";
                 fastcgi_param PATH_INFO $fastcgi_path_info;
@@ -631,7 +740,7 @@ in
               root    * /${pkg hostName cfg}/share/wordpress
               file_server
 
-              php_fastcgi unix/${config.services.phpfpm.pools."wordpress-${hostName}".socket}
+              php_fastcgi unix/${(phpfpmPoolOpt hostName) socket}
 
               @uploads {
                 path_regexp path /uploads\/(.*)\.php
