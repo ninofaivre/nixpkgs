@@ -107,6 +107,19 @@ in
 
     package = mkPackageOption pkgs "traefik" { };
 
+    legoEnvVarsFileSecret = mkOption {
+      default = {};
+      type =  types.attrsOf types.path;
+      example = {
+        CF_DNS_API_TOKEN = "/run/secrets/cloudflareDnsApiToken";
+      };
+      # TODO better description
+      description = ''
+        Load files via systemd LoadCredential and inject the loaded path in
+        env.
+      '';
+    };
+
     environmentFiles = mkOption {
       default = [ ];
       type = types.listOf types.path;
@@ -119,7 +132,7 @@ in
   };
 
   config = mkIf cfg.enable {
-    systemd.tmpfiles.rules = [ "d '${cfg.dataDir}' 0700 traefik traefik - -" ];
+    systemd.tmpfiles.rules = [ "d '${cfg.dataDir}' 0701 traefik traefik - -" ];
 
     systemd.services.traefik = {
       description = "Traefik web server";
@@ -128,7 +141,13 @@ in
       wantedBy = [ "multi-user.target" ];
       startLimitIntervalSec = 86400;
       startLimitBurst = 5;
+      environment = lib.attrsets.mapAttrs' (name: _:
+        nameValuePair "${name}_FILE" "%d/${name}"
+      ) cfg.legoEnvVarsFileSecret;
       serviceConfig = {
+        LoadCredential = lib.attrsets.mapAttrsToList (name: path:
+          "${name}:${path}"
+        ) cfg.legoEnvVarsFileSecret;
         EnvironmentFile = cfg.environmentFiles;
         ExecStartPre = lib.optional (cfg.environmentFiles != [ ]) (
           pkgs.writeShellScript "pre-start" ''
